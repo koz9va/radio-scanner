@@ -108,10 +108,10 @@ def scan_frequency_range(start_freq: float,
         scanner.wait()
 
         samples = scanner.get_samples()
-        #
-        # np.save(f'samples/samples_{i}.npy', samples, allow_pickle=True)
+
+        np.save(f'samples/samples_{i}.npy', samples, allow_pickle=True)
         # samples = np.load(f'samples/samples_{i}.npy')
-        # i += 1
+        i += 1
 
         scanner.stop()
 
@@ -171,6 +171,7 @@ def scan_frequency_range(start_freq: float,
 
 
 def build_spectrogram(candidates: list[float], sample_rate: float, num_samples: int):
+    i = 0
     for freq in candidates:
         scanner = HackRfScanner(float(freq), sample_rate, num_samples)
         scanner.start()
@@ -178,6 +179,10 @@ def build_spectrogram(candidates: list[float], sample_rate: float, num_samples: 
         scanner.wait()
 
         samples = scanner.get_samples()
+
+        np.save(f'samples_spect/samples_{i}.npy', samples, allow_pickle=True)
+        # samples = np.load(f'samples/samples_{i}.npy')
+        i += 1
 
         scanner.stop()
 

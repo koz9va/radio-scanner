@@ -1,0 +1,8 @@
+.DS_Store
+.idea
+
+**/*.jpg
+**/*.png
+
+**/*.npy
+samples/

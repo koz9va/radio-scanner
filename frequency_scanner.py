@@ -1,10 +1,12 @@
 import osmosdr
+from math import floor
 import structlog
 import numpy as np
 from gnuradio import gr, blocks, analog
 import matplotlib.pyplot as plt
-from scipy.signal import find_peaks as sci_find_peaks, ShortTimeFFT
-from scipy.signal.windows import nuttall
+from scipy.signal import find_peaks as sci_find_peaks,  savgol_filter
+import cupyx.scipy.signal as cu_signal
+import cupy
 
 structlog.configure(processors=[structlog.processors.JSONRenderer()])
 logger = structlog.get_logger()
@@ -18,28 +20,9 @@ def median_truncate(data: np.ndarray, div_factor: int) -> np.ndarray:
 
     return out
 
-def shrink_array_by_median(arr: np.ndarray, factor: int) -> np.ndarray:
-    """
-    Shrinks a 1D NumPy array by a factor, taking the median of each segment.
-
-    Parameters:
-      arr: 1D numpy array
-      factor: integer factor by which to shrink the array
-
-    Returns:
-      A new 1D numpy array where each element is the median of a segment of length 'factor'
-    """
-    n = len(arr)
-    # Trim array so length is a multiple of factor
-    trimmed_length = (n // factor) * factor
-    trimmed = arr[:trimmed_length]
-    # Reshape into a 2D array with shape (-1, factor)
-    reshaped = trimmed.reshape(-1, factor)
-    # Take the median along axis 1
-    return np.median(reshaped, axis=1)
 
 
-class HackRfScanner(gr.top_block):
+class RfScanner(gr.top_block):
     source: osmosdr.source
     agc: analog.agc_cc
     head: blocks.head
@@ -62,10 +45,11 @@ class HackRfScanner(gr.top_block):
         self.source = osmosdr.source(args='hackrf')
         self.source.set_center_freq(self.center_freq)
         self.source.set_sample_rate(self.sample_rate)
-        self.source.set_gain(20)
+        # self.source.set_gain(20)
+        self.source.set_if_gain(16) # default from official docs. No more than 47
+        self.source.set_bb_gain(16)
+        self.source.set_gain(0)
 
-        self.agc = analog.agc_cc(1e-3, 1.0, 1.0)
-        self.agc.set_max_gain(10000)
 
 
         # taps = filter.firdes.low_pass(
@@ -82,7 +66,7 @@ class HackRfScanner(gr.top_block):
         self.head = blocks.head(gr.sizeof_gr_complex, self.num_samples)
         self.sink = blocks.vector_sink_c()
 
-        self.connect(self.source, self.agc, self.head, self.sink)
+        self.connect(self.source, self.head, self.sink)
 
     def get_samples(self):
         return np.array(self.sink.data(), dtype=np.complex64)
@@ -102,16 +86,16 @@ def scan_frequency_range(start_freq: float,
     all_power_list = []
     i = 0
     for freq in np.arange(start_freq, stop_freq, step):
-        scanner = HackRfScanner(float(start_freq), sample_rate, num_samples)
+        scanner = RfScanner(float(start_freq), sample_rate, num_samples)
         scanner.start()
         scanner.set_center_freq(freq)
         scanner.wait()
 
         samples = scanner.get_samples()
-
-        np.save(f'samples/samples_{i}.npy', samples, allow_pickle=True)
+        #
+        # np.save(f'samples/samples_{i}.npy', samples, allow_pickle=True)
         # samples = np.load(f'samples/samples_{i}.npy')
-        i += 1
+        # i += 1
 
         scanner.stop()
 
@@ -139,7 +123,9 @@ def scan_frequency_range(start_freq: float,
     # windowed_freqs = shrink_array_by_median(all_freqs_sorted, 100)
     # windowed_power = shrink_array_by_median(all_power_sorted, 100)
     windowed_freqs = all_freqs_sorted.reshape(-1, 1000).mean(axis=1)
-    windowed_power = all_power_sorted.reshape(-1, 1000).mean(axis=1)
+    # windowed_power = all_power_sorted.reshape(-1, 1000).mean(axis=1)
+    windowed_power = savgol_filter(all_power_sorted, window_length=101, polyorder=4)
+    windowed_power = windowed_power[::1000]
     # windowed_freqs = savgol_filter(all_freqs_sorted, 101, 2)
     # windowed_power = savgol_filter(all_power_sorted, 101, 2)
 
@@ -165,59 +151,99 @@ def scan_frequency_range(start_freq: float,
         plt.title(f"Combined Spectrum from {start_freq / 1e6:.2f} MHz to {stop_freq / 1e6:.2f} MHz")
         plt.legend()
         plt.grid(True)
-        plt.show()
+        plt.savefig('samples/images/all_spectrum.png')
 
     return center_frequencies
 
 
+
+def downsample(samples, factor):
+    return samples[::factor]
+
+
+def get_noise_threshold(s_mag: np.ndarray, noise_additive = 3):
+    flat_db = s_mag.flatten()
+    hist_vals, bin_edges = np.histogram(flat_db, bins=200)
+    noise_floor = bin_edges[np.argmax(hist_vals)]
+    return noise_floor + noise_additive # db
+
+
 def build_spectrogram(candidates: list[float], sample_rate: float, num_samples: int):
-    i = 0
+    downsample_factor = 10
     for freq in candidates:
-        scanner = HackRfScanner(float(freq), sample_rate, num_samples)
+        scanner = RfScanner(float(freq), sample_rate, num_samples)
         scanner.start()
         scanner.set_center_freq(freq)
         scanner.wait()
-
-        samples = scanner.get_samples()
-
-        np.save(f'samples_spect/samples_{i}.npy', samples, allow_pickle=True)
-        # samples = np.load(f'samples/samples_{i}.npy')
-        i += 1
-
+        samples = cupy.asarray(scanner.get_samples())
         scanner.stop()
 
-        # M = int(np.floor(np.log2(0.005 * sample_rate)))
-        M = int(sample_rate//100)
-        w = nuttall(M//2)
-        SFT = ShortTimeFFT(w, hop=M//4, fs=sample_rate, fft_mode='centered')
 
-        Sx = SFT.spectrogram(samples)
+        zoomed_samples = downsample(samples, downsample_factor)
+
+        sample_rate /= downsample_factor
+
+        S_complex = cu_signal.stft(zoomed_samples, fs=sample_rate)[2]
+
+        # complex spectrogram
+        # S_complex = SFT.stft(samples)
         del samples
 
-        duration = num_samples/sample_rate
+        # axes
+        n_freq, n_time = S_complex.shape
+        duration = num_samples / sample_rate
+        f = np.linspace(freq - sample_rate/2, freq + sample_rate/2, n_freq)
+        t = np.linspace(0, duration, n_time)
 
-        f = np.linspace(freq-(sample_rate/2), freq+(sample_rate/2), Sx.shape[0])
-        t = np.linspace(0, duration, Sx.shape[1])
+        # 1) magnitude (dB)
 
-        Sx_db = 10 * np.log10(np.fmax(Sx, 1e-4))
-        del Sx
+        s_mag_db_gpu = 20 * cupy.log10(np.abs(S_complex) + 1e-12)
 
-        plt.figure()
-        plt.pcolormesh(t, f, Sx_db, shading='gouraud')
-        plt.xlabel('Time')
-        plt.ylabel('Frequency')
-        plt.title(f'spectrogram of {freq}')
-        plt.colorbar(label='Power db')
-        plt.show()
+        noise_level = get_noise_threshold(s_mag_db_gpu, noise_additive=2)
 
-        del Sx_db
+        s_mag_db_gpu = s_mag_db_gpu / (1 + cupy.exp(0.5 * (s_mag_db_gpu - noise_level)))
 
+        s_mag_db = cupy.asnumpy(s_mag_db_gpu)
 
+        plt.figure(figsize=(8,4))
+        plt.pcolormesh(t, f, s_mag_db, shading='gouraud')
+        plt.title(f'Magnitude Spectrogram ({freq/1e6:.3f} MHz)')
+        plt.xlabel('Time [s]'); plt.ylabel('Frequency [Hz]')
+        plt.colorbar(label='dB')
+        plt.tight_layout()
+        plt.savefig(f'samples/images/spec_{floor(freq/1e3)}_mag.png')
+        plt.close()
+
+        # 2) phase
+        # phase_spec = np.angle(cupy.asnumpy(S_complex))
+        # plt.figure(figsize=(8,4))
+        # plt.pcolormesh(t, f, phase_spec, shading='gouraud', cmap='twilight')
+        # plt.title(f'Phase Spectrogram ({freq/1e6:.3f} MHz)')
+        # plt.xlabel('Time [s]'); plt.ylabel('Frequency [Hz]')
+        # plt.colorbar(label='rad')
+        # plt.tight_layout()
+        # plt.savefig(f'samples/images/spec_{freq/1e3}_phase.png')
+        # plt.close()
+
+        # 3) instantaneous frequency
+        # unwrapped = np.unwrap(phase_spec, axis=1)
+        # dphase   = np.diff(unwrapped, axis=1)
+        # dt       = hop / sample_rate
+        # inst_freq = (dphase/(2*np.pi)) / dt
+        # t_if = t[:-1]
+        # plt.figure(figsize=(8,4))
+        # plt.pcolormesh(t_if, f, inst_freq, shading='gouraud', cmap='magma')
+        # plt.title(f'Instantaneous Frequency ({freq/1e6:.3f} MHz)')
+        # plt.xlabel('Time [s]'); plt.ylabel('Frequency [Hz]')
+        # plt.colorbar(label='Hz')
+        # plt.tight_layout()
+        # plt.savefig(f'samples/images/spec_{round(freq/1e6)}_instfreq.png')
+        # plt.close()
 
 
 def main():
-    start_freq = 88e6
-    stop_freq = 110e6
+    start_freq = 98e6
+    stop_freq = 101e6
     step = 200e3
     sample_rate = 8e6
     num_samples = int(sample_rate // 10)
@@ -236,9 +262,10 @@ def main():
 
     logger.debug('Detected frequencies', detected=freq_candidates, num_detected=len(freq_candidates))
 
-    # freq_candidates = [96.4e6]
-
-    build_spectrogram(freq_candidates, 2**19, int(2**18))
+    # freq_candidates = [e6]
+    # #
+    # build_spectrogram(freq_candidates, 2**25, int(2**20))
+    build_spectrogram(freq_candidates, 2**23, int(2**20))
 
 if __name__ == '__main__':
     main()

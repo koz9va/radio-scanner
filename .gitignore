@@ -6,4 +6,7 @@
 
 **/*.npy
 samples/
+<<<<<<< HEAD
 samples*/
+=======
+>>>>>>> 3bdda69 (Implemeted adaptive spectrogram gain, set up hackrf gain)

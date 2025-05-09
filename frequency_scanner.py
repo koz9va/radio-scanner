@@ -4,7 +4,7 @@ import structlog
 import numpy as np
 from gnuradio import gr, blocks, analog
 import matplotlib.pyplot as plt
-from scipy.signal import find_peaks as sci_find_peaks,  savgol_filter
+from scipy.signal import find_peaks as sci_find_peaks,  savgol_filter, resample_poly
 import cupyx.scipy.signal as cu_signal
 import cupy
 
@@ -85,7 +85,7 @@ def scan_frequency_range(start_freq: float,
     all_freqs_list = []
     all_power_list = []
     i = 0
-    for freq in np.arange(start_freq, stop_freq, step):
+    for freq in np.arange(start_freq, stop_freq, sample_rate):
         scanner = RfScanner(float(start_freq), sample_rate, num_samples)
         scanner.start()
         scanner.set_center_freq(freq)
@@ -168,40 +168,80 @@ def get_noise_threshold(s_mag: np.ndarray, noise_additive = 3):
     return noise_floor + noise_additive # db
 
 
-def build_spectrogram(candidates: list[float], sample_rate: float, num_samples: int):
-    downsample_factor = 10
+def spectrogram_contrast(s_mag_db: cupy.ndarray, window_size: int = 10, threshold_percentile: float = 50,
+                                 threshold_strength: float = 0.05) -> cupy.ndarray:
+
+    tbins, nbins = s_mag_db.shape
+
+    S_cpu = cupy.asnumpy(s_mag_db).astype(np.float32)
+    AZ = np.zeros_like(S_cpu)
+
+    for i in range(tbins):
+        start = max(0, i - window_size + 1)
+        AZ[i, :] = np.mean(S_cpu[start:i + 1, :], axis=0)
+
+    AZ_norm = (AZ - AZ.min()) / (AZ.max() - AZ.min() + 1e-8)
+
+    azt = np.percentile(AZ_norm, threshold_percentile)
+    azt += (AZ_norm.max() - azt) * threshold_strength
+
+    AZ_norm[AZ_norm < azt] = 0
+    AZ_norm = 1 - AZ_norm
+
+    return cupy.asarray(AZ_norm, dtype=cupy.float32)
+
+
+def histogram_of_dominant_freqs(s_mag_db: np.ndarray, freqs: np.ndarray, threshold_db: float = -60) -> tuple[np.ndarray, np.ndarray]:
+    time_bins = s_mag_db.shape[1]
+    dominant_freq_indices = []
+
+    for t in range(time_bins):
+        slice_db = s_mag_db[:, t]
+        idx = np.argmax(slice_db) # or use: slice_db > threshold_db
+        if slice_db[idx] > threshold_db:
+            dominant_freq_indices.append(idx)
+
+    hist, bins = np.histogram(dominant_freq_indices, bins=len(freqs), range=(0, len(freqs)))
+    freqs_hist = freqs  # 1:1 mapping
+
+    return hist, freqs_hist
+
+def build_spectrogram(candidates: list[float], sample_rate: float, num_samples: int, desired_sample_rate: int):
+    downsample_factor = int(sample_rate/desired_sample_rate)
+    reduced_sample_rate = sample_rate / downsample_factor
     for freq in candidates:
         scanner = RfScanner(float(freq), sample_rate, num_samples)
         scanner.start()
         scanner.set_center_freq(freq)
         scanner.wait()
-        samples = cupy.asarray(scanner.get_samples())
+        samples = scanner.get_samples()
         scanner.stop()
 
+        # samples = lowpass_fir_filter(samples, sample_rate, cutoff_hz=sample_rate / (2 * downsample_factor))
 
-        zoomed_samples = downsample(samples, downsample_factor)
+        # zoomed_samples = downsample(samples, downsample_factor)
+        resampled = resample_poly(x=samples, up=1, down=downsample_factor)
 
-        sample_rate /= downsample_factor
-
-        S_complex = cu_signal.stft(zoomed_samples, fs=sample_rate)[2]
+        s_complex = cu_signal.stft(cupy.asarray(resampled), fs=reduced_sample_rate)[2]
 
         # complex spectrogram
-        # S_complex = SFT.stft(samples)
+        # s_complex = SFT.stft(samples)
         del samples
 
         # axes
-        n_freq, n_time = S_complex.shape
-        duration = num_samples / sample_rate
-        f = np.linspace(freq - sample_rate/2, freq + sample_rate/2, n_freq)
+        n_freq, n_time = s_complex.shape
+        duration = num_samples / sample_rate / downsample_factor
+        f = np.linspace(freq - reduced_sample_rate/2, freq + reduced_sample_rate/2, n_freq)
         t = np.linspace(0, duration, n_time)
 
         # 1) magnitude (dB)
 
-        s_mag_db_gpu = 20 * cupy.log10(np.abs(S_complex) + 1e-12)
+        s_mag_db_gpu = 20 * cupy.log10(cupy.abs(s_complex) + 1e-12)
 
-        noise_level = get_noise_threshold(s_mag_db_gpu, noise_additive=2)
-
-        s_mag_db_gpu = s_mag_db_gpu / (1 + cupy.exp(0.5 * (s_mag_db_gpu - noise_level)))
+        s_mag_db_gpu = spectrogram_contrast(s_mag_db_gpu)
+        # noise_level = get_noise_threshold(s_mag_db_gpu, noise_additive=2)
+        #
+        # s_mag_db_gpu = s_mag_db_gpu / (1 + cupy.exp(0.5 * (s_mag_db_gpu - noise_level)))
 
         s_mag_db = cupy.asnumpy(s_mag_db_gpu)
 
@@ -214,8 +254,19 @@ def build_spectrogram(candidates: list[float], sample_rate: float, num_samples: 
         plt.savefig(f'samples/images/spec_{floor(freq/1e3)}_mag.png')
         plt.close()
 
+        hist, freqs_hist = histogram_of_dominant_freqs(s_mag_db, f)
+
+        plt.figure(figsize=(10, 3))
+        plt.plot(freqs_hist, hist)
+        plt.title(f"Histogram of {floor(freq/1e3)} MHz")
+        plt.xlabel("Frequency (Hz)")
+        plt.ylabel("Hits")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(f'samples/images/hist_{floor(freq/1e3)}.png')
+
         # 2) phase
-        # phase_spec = np.angle(cupy.asnumpy(S_complex))
+        # phase_spec = np.angle(cupy.asnumpy(s_complex))
         # plt.figure(figsize=(8,4))
         # plt.pcolormesh(t, f, phase_spec, shading='gouraud', cmap='twilight')
         # plt.title(f'Phase Spectrogram ({freq/1e6:.3f} MHz)')
@@ -242,9 +293,9 @@ def build_spectrogram(candidates: list[float], sample_rate: float, num_samples: 
 
 
 def main():
-    start_freq = 98e6
-    stop_freq = 101e6
-    step = 200e3
+    start_freq = 80e6
+    stop_freq = 110e6
+    step = 1e6
     sample_rate = 8e6
     num_samples = int(sample_rate // 10)
 
@@ -255,17 +306,19 @@ def main():
                                     sample_rate,
                                     num_samples,
                                     5e3,
-                                    300e3,
+                                    200e3,
                                     visualize=True,
                                     noise_above=0.03
                                    )
-
-    logger.debug('Detected frequencies', detected=freq_candidates, num_detected=len(freq_candidates))
-
-    # freq_candidates = [e6]
+    #
+    # logger.debug('Detected frequencies', detected=freq_candidates, num_detected=len(freq_candidates))
+    #
+    # freq_candidates = [92814370.0, 96e6, 94594370.0, 96778120.0, 99005620.0, 102498120.0, 104000620.0, 105000620.0, 106479280.71,
+    #                    120e3]
+    # freq_candidates = [104.2e6]
     # #
     # build_spectrogram(freq_candidates, 2**25, int(2**20))
-    build_spectrogram(freq_candidates, 2**23, int(2**20))
+    build_spectrogram(freq_candidates, 2**23, int(2**21), 500_000)
 
 if __name__ == '__main__':
     main()
